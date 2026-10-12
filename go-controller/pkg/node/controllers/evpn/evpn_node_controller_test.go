@@ -12,6 +12,7 @@ import (
 	nadfake "github.com/k8snetworkplumbingwg/network-attachment-definition-client/pkg/client/clientset/versioned/fake"
 	"github.com/stretchr/testify/mock"
 	"github.com/vishvananda/netlink"
+	"golang.org/x/sys/unix"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -940,6 +941,150 @@ var _ = Describe("EVPN node controller", func() {
 			}).Should(ContainElements(bridgeName, vxlan4Name))
 		})
 
+		setPrimaryAnnotation := func(annotation string) {
+			GinkgoHelper()
+			node, err := kubeClient.CoreV1().Nodes().Get(context.Background(), nodeName, metav1.GetOptions{})
+			Expect(err).NotTo(HaveOccurred(), "get node %s before setting its primary address", nodeName)
+			if node.Annotations == nil {
+				node.Annotations = map[string]string{}
+			}
+			node.Annotations[util.OvnNodeIfAddr] = annotation
+			_, err = kubeClient.CoreV1().Nodes().Update(context.Background(), node, metav1.UpdateOptions{})
+			Expect(err).NotTo(HaveOccurred(), "set primary address annotation on node %s", nodeName)
+			Eventually(func() (string, error) {
+				node, err := wf.GetNode(nodeName)
+				if err != nil {
+					return "", fmt.Errorf("get node %s from informer: %w", nodeName, err)
+				}
+				return node.Annotations[util.OvnNodeIfAddr], nil
+			}).Should(Equal(annotation), "wait for primary annotation in node informer")
+		}
+
+		selectedIPs := func() ([]string, error) {
+			node, err := kubeClient.CoreV1().Nodes().Get(context.Background(), nodeName, metav1.GetOptions{})
+			if err != nil {
+				return nil, fmt.Errorf("get node %s while checking VTEP %s: %w", nodeName, vtepName, err)
+			}
+			vteps, err := util.ParseNodeVTEPs(node)
+			if err != nil {
+				return nil, fmt.Errorf("parse VTEPs on node %s: %w", nodeName, err)
+			}
+			return vteps[vtepName].IPs, nil
+		}
+
+		DescribeTable("converges from a still-present VIP when the primary becomes eligible", func(annotationArrives bool, vip, primary, subnet, annotation string) {
+			family, bits := netlink.FAMILY_V4, 32
+			if utilnet.IsIPv6String(primary) {
+				family, bits = netlink.FAMILY_V6, 128
+			}
+			nlMock := &mocks.NetLinkOps{}
+			util.SetNetLinkOpMockInst(nlMock)
+			DeferCleanup(util.ResetNetLinkOpMockInst)
+			nlMock.On("AddrList", mock.Anything, family).Return([]netlink.Addr{
+				{IPNet: &net.IPNet{IP: net.ParseIP(vip), Mask: net.CIDRMask(bits, bits)}},
+				{IPNet: &net.IPNet{IP: net.ParseIP(primary), Mask: net.CIDRMask(bits, bits)}},
+			}, nil)
+			var sourceMu sync.Mutex
+			var sourceIP string
+			ndm.On("DeleteLink", mock.Anything).Return(nil)
+			ndm.On("EnsureLink", mock.Anything).Return(nil).Run(func(args mock.Arguments) {
+				cfg := args.Get(0).(netlinkdevicemanager.DeviceConfig)
+				if vxlan, ok := cfg.Link.(*netlink.Vxlan); ok {
+					sourceMu.Lock()
+					defer sourceMu.Unlock()
+					sourceIP = vxlan.SrcAddr.String()
+				}
+			})
+			vxlanSource := func() string {
+				sourceMu.Lock()
+				defer sourceMu.Unlock()
+				return sourceIP
+			}
+
+			if annotationArrives {
+				am.SetIPs([]net.IP{net.ParseIP(vip), net.ParseIP(primary)})
+			} else {
+				setPrimaryAnnotation(annotation)
+				am.SetIPs([]net.IP{net.ParseIP(vip)})
+			}
+			_, err := vtepClient.K8sV1().VTEPs().Create(context.Background(), &vtepv1.VTEP{
+				ObjectMeta: metav1.ObjectMeta{Name: vtepName},
+				Spec: vtepv1.VTEPSpec{
+					CIDRs: []vtepv1.CIDR{vtepv1.CIDR(subnet)},
+					Mode:  vtepv1.VTEPModeUnmanaged,
+				},
+			}, metav1.CreateOptions{})
+			Expect(err).NotTo(HaveOccurred(), "create unmanaged VTEP %s", vtepName)
+			Eventually(selectedIPs).Should(ConsistOf(vip), "select VIP %s before primary %s is eligible", vip, primary)
+			Eventually(vxlanSource).Should(Equal(vip), "configure VXLAN with the initially selected VIP")
+
+			if annotationArrives {
+				By("setting only the primary annotation while both addresses remain present")
+				setPrimaryAnnotation(annotation)
+			} else {
+				By("adding the primary address without removing the annotated VIP")
+				am.SetIPs([]net.IP{net.ParseIP(vip), net.ParseIP(primary)})
+				am.NotifyAddressesChanged()
+			}
+			Eventually(selectedIPs).Should(ConsistOf(primary), "converge to primary %s without removing VIP %s", primary, vip)
+			Eventually(vxlanSource).Should(Equal(primary), "update the VXLAN source to the primary address")
+		},
+			Entry("after an IPv4 address change", false, "100.64.0.5", "100.64.0.53", "100.64.0.0/24", `{"ipv4":"100.64.0.53/24"}`),
+			Entry("after an IPv4 primary annotation change", true, "100.64.0.5", "100.64.0.53", "100.64.0.0/24", `{"ipv4":"100.64.0.53/24"}`),
+			Entry("after an IPv6 address change", false, "fd00::5", "fd00::53", "fd00::/64", `{"ipv6":"fd00::53/64"}`),
+			Entry("after an IPv6 primary annotation change", true, "fd00::5", "fd00::53", "fd00::/64", `{"ipv6":"fd00::53/64"}`),
+		)
+
+		DescribeTable("skips reconciliation for an ineligible or already selected primary", func(selected, subnet, annotation string, addresses []net.IP) {
+			var ensuredMu sync.Mutex
+			var ensuredCount int
+			var sourceIP string
+			ndm.On("DeleteLink", mock.Anything).Return(nil)
+			ndm.On("EnsureLink", mock.Anything).Return(nil).Run(func(args mock.Arguments) {
+				ensuredMu.Lock()
+				defer ensuredMu.Unlock()
+				ensuredCount++
+				cfg := args.Get(0).(netlinkdevicemanager.DeviceConfig)
+				if vxlan, ok := cfg.Link.(*netlink.Vxlan); ok {
+					sourceIP = vxlan.SrcAddr.String()
+				}
+			})
+			deviceUpdates := func() int {
+				ensuredMu.Lock()
+				defer ensuredMu.Unlock()
+				return ensuredCount
+			}
+			am.SetIPs([]net.IP{net.ParseIP(selected)})
+			_, err := vtepClient.K8sV1().VTEPs().Create(context.Background(), &vtepv1.VTEP{
+				ObjectMeta: metav1.ObjectMeta{Name: vtepName},
+				Spec: vtepv1.VTEPSpec{
+					CIDRs: []vtepv1.CIDR{vtepv1.CIDR(subnet)},
+					Mode:  vtepv1.VTEPModeUnmanaged,
+				},
+			}, metav1.CreateOptions{})
+			Expect(err).NotTo(HaveOccurred(), "create unmanaged VTEP %s", vtepName)
+			Eventually(selectedIPs).Should(ConsistOf(selected), "annotate the initial VTEP address")
+			Eventually(func() string {
+				ensuredMu.Lock()
+				defer ensuredMu.Unlock()
+				return sourceIP
+			}).Should(Equal(selected), "finish initial VXLAN configuration")
+			initialCount := deviceUpdates()
+
+			am.SetIPs(addresses)
+			setPrimaryAnnotation(annotation)
+			am.NotifyAddressesChanged()
+			Consistently(deviceUpdates).Should(Equal(initialCount), "do not reconfigure devices for an ineligible or already selected primary")
+			Expect(selectedIPs()).To(ConsistOf(selected), "keep the valid annotated VTEP address")
+		},
+			Entry("IPv4 primary is not locally present", "100.64.0.5", "100.64.0.0/24", `{"ipv4":"100.64.0.53/24"}`, []net.IP{net.ParseIP("100.64.0.5")}),
+			Entry("IPv6 primary is not locally present", "fd00::5", "fd00::/64", `{"ipv6":"fd00::53/64"}`, []net.IP{net.ParseIP("fd00::5")}),
+			Entry("IPv4 primary is outside the VTEP CIDRs", "100.64.0.5", "100.64.0.0/24", `{"ipv4":"192.168.1.53/24"}`, []net.IP{net.ParseIP("100.64.0.5"), net.ParseIP("192.168.1.53")}),
+			Entry("IPv6 primary is outside the VTEP CIDRs", "fd00::5", "fd00::/64", `{"ipv6":"fd01::53/64"}`, []net.IP{net.ParseIP("fd00::5"), net.ParseIP("fd01::53")}),
+			Entry("IPv4 primary is already selected", "100.64.0.53", "100.64.0.0/24", `{"ipv4":"100.64.0.53/24"}`, []net.IP{net.ParseIP("100.64.0.53")}),
+			Entry("IPv6 primary is already selected", "fd00::53", "fd00::/64", `{"ipv6":"fd00::53/64"}`, []net.IP{net.ParseIP("fd00::53")}),
+		)
+
 		It("skips reconciliation when annotated IPs are still valid", func() {
 			var ensuredMu sync.Mutex
 			var ensuredCfgs []netlinkdevicemanager.DeviceConfig
@@ -1356,8 +1501,9 @@ var _ = Describe("vtepNeedsUpdate", func() {
 })
 
 type fakeAddressManager struct {
-	mu  sync.Mutex
-	ips []net.IP
+	mu                 sync.Mutex
+	ips                []net.IP
+	onAddressesChanged func()
 }
 
 func (f *fakeAddressManager) SetIPs(ips []net.IP) {
@@ -1374,7 +1520,20 @@ func (f *fakeAddressManager) ListAddresses() ([]net.IP, []*net.IPNet) {
 	return out, nil
 }
 
-func (f *fakeAddressManager) AddOnAddressesChangedHandler(func()) {}
+func (f *fakeAddressManager) AddOnAddressesChangedHandler(handler func()) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.onAddressesChanged = handler
+}
+
+func (f *fakeAddressManager) NotifyAddressesChanged() {
+	f.mu.Lock()
+	handler := f.onAddressesChanged
+	f.mu.Unlock()
+	if handler != nil {
+		handler()
+	}
+}
 
 var _ = Describe("discoverUnmanagedVTEPIPs", func() {
 	const nodeName = "node1"
@@ -1493,6 +1652,127 @@ var _ = Describe("discoverUnmanagedVTEPIPs", func() {
 		Expect(err).NotTo(HaveOccurred())
 		Expect(vteps).To(HaveLen(1))
 		Expect(vteps["vtep1"].IPs).To(ConsistOf("100.64.0.1"))
+	})
+
+	It("prefers the node primary address over an unlabelled IPv4 VIP that sorts lower", func() {
+		// kube-vip (routing-table mode) installs the VIP as a plain /32 with no
+		// address label; it passes the keepalived filter and sorts first.
+		tc := newTestController(
+			[]net.IP{net.ParseIP("100.64.0.5"), net.ParseIP("100.64.0.53")},
+			map[string]string{util.OvnNodeIfAddr: `{"ipv4":"100.64.0.53/24"}`},
+		)
+		vtep := &vtepv1.VTEP{
+			ObjectMeta: metav1.ObjectMeta{Name: "vtep1"},
+			Spec:       vtepv1.VTEPSpec{CIDRs: []vtepv1.CIDR{"100.64.0.0/24"}},
+		}
+		nlMock := &mocks.NetLinkOps{}
+		util.SetNetLinkOpMockInst(nlMock)
+		defer util.ResetNetLinkOpMockInst()
+		nlMock.On("AddrList", mock.Anything, netlink.FAMILY_V4).Return([]netlink.Addr{
+			{IPNet: &net.IPNet{IP: net.ParseIP("100.64.0.5"), Mask: net.CIDRMask(32, 32)}, Flags: unix.IFA_F_DEPRECATED},
+			{IPNet: &net.IPNet{IP: net.ParseIP("100.64.0.53"), Mask: net.CIDRMask(24, 32)}},
+		}, nil)
+		v4, _, err := tc.discoverUnmanagedVTEPIPs(vtep)
+		Expect(err).NotTo(HaveOccurred(), "discoverUnmanagedVTEPIPs failed")
+		Expect(v4.String()).To(Equal("100.64.0.53"), "unexpected selected VTEP IP")
+		vteps, err := util.ParseNodeVTEPs(tc.node)
+		Expect(err).NotTo(HaveOccurred(), "failed to parse node VTEP annotation")
+		Expect(vteps["vtep1"].IPs).To(ConsistOf("100.64.0.53"), "unexpected annotated VTEP IPs")
+	})
+
+	It("prefers the node primary address over an IPv6 VIP, where address labels do not exist", func() {
+		// IPv6 addresses carry no label and IFA_F_SECONDARY means
+		// IFA_F_TEMPORARY, so the keepalived filter cannot identify any VIP.
+		tc := newTestController(
+			[]net.IP{net.ParseIP("fd00::5"), net.ParseIP("fd00::1c")},
+			map[string]string{util.OvnNodeIfAddr: `{"ipv6":"fd00::1c/64"}`},
+		)
+		vtep := &vtepv1.VTEP{
+			ObjectMeta: metav1.ObjectMeta{Name: "vtep1"},
+			Spec:       vtepv1.VTEPSpec{CIDRs: []vtepv1.CIDR{"fd00::/64"}},
+		}
+		nlMock := &mocks.NetLinkOps{}
+		util.SetNetLinkOpMockInst(nlMock)
+		defer util.ResetNetLinkOpMockInst()
+		nlMock.On("AddrList", mock.Anything, netlink.FAMILY_V6).Return([]netlink.Addr{
+			{IPNet: &net.IPNet{IP: net.ParseIP("fd00::5"), Mask: net.CIDRMask(128, 128)}, Flags: unix.IFA_F_DEPRECATED},
+			{IPNet: &net.IPNet{IP: net.ParseIP("fd00::1c"), Mask: net.CIDRMask(128, 128)}},
+		}, nil)
+		_, v6, err := tc.discoverUnmanagedVTEPIPs(vtep)
+		Expect(err).NotTo(HaveOccurred(), "discoverUnmanagedVTEPIPs failed")
+		Expect(v6.String()).To(Equal("fd00::1c"), "unexpected selected VTEP IP")
+		vteps, err := util.ParseNodeVTEPs(tc.node)
+		Expect(err).NotTo(HaveOccurred(), "failed to parse node VTEP annotation")
+		Expect(vteps["vtep1"].IPs).To(ConsistOf("fd00::1c"), "unexpected annotated VTEP IPs")
+	})
+
+	It("ignores the node primary address when it is not a candidate and keeps picking the lowest IP", func() {
+		// VTEP CIDR on a secondary network: the primary address plays no role.
+		tc := newTestController(
+			[]net.IP{net.ParseIP("100.64.0.5"), net.ParseIP("100.64.0.2")},
+			map[string]string{util.OvnNodeIfAddr: `{"ipv4":"192.168.1.10/24"}`},
+		)
+		vtep := &vtepv1.VTEP{
+			ObjectMeta: metav1.ObjectMeta{Name: "vtep1"},
+			Spec:       vtepv1.VTEPSpec{CIDRs: []vtepv1.CIDR{"100.64.0.0/24"}},
+		}
+		nlMock := &mocks.NetLinkOps{}
+		util.SetNetLinkOpMockInst(nlMock)
+		defer util.ResetNetLinkOpMockInst()
+		nlMock.On("AddrList", mock.Anything, netlink.FAMILY_V4).Return([]netlink.Addr{
+			{IPNet: &net.IPNet{IP: net.ParseIP("100.64.0.5"), Mask: net.CIDRMask(24, 32)}},
+			{IPNet: &net.IPNet{IP: net.ParseIP("100.64.0.2"), Mask: net.CIDRMask(24, 32)}},
+		}, nil)
+		v4, _, err := tc.discoverUnmanagedVTEPIPs(vtep)
+		Expect(err).NotTo(HaveOccurred(), "discoverUnmanagedVTEPIPs failed")
+		Expect(v4.String()).To(Equal("100.64.0.2"), "unexpected selected VTEP IP")
+	})
+
+	It("re-picks the node primary address when a VIP was annotated earlier", func() {
+		tc := newTestController(
+			[]net.IP{net.ParseIP("100.64.0.5"), net.ParseIP("100.64.0.53")},
+			map[string]string{
+				util.OvnNodeIfAddr: `{"ipv4":"100.64.0.53/24"}`,
+				util.OVNNodeVTEPs:  `{"vtep1":{"ips":["100.64.0.5"]}}`,
+			},
+		)
+		vtep := &vtepv1.VTEP{
+			ObjectMeta: metav1.ObjectMeta{Name: "vtep1"},
+			Spec:       vtepv1.VTEPSpec{CIDRs: []vtepv1.CIDR{"100.64.0.0/24"}},
+		}
+		nlMock := &mocks.NetLinkOps{}
+		util.SetNetLinkOpMockInst(nlMock)
+		defer util.ResetNetLinkOpMockInst()
+		nlMock.On("AddrList", mock.Anything, netlink.FAMILY_V4).Return([]netlink.Addr{
+			{IPNet: &net.IPNet{IP: net.ParseIP("100.64.0.5"), Mask: net.CIDRMask(32, 32)}, Flags: unix.IFA_F_DEPRECATED},
+			{IPNet: &net.IPNet{IP: net.ParseIP("100.64.0.53"), Mask: net.CIDRMask(24, 32)}},
+		}, nil)
+		v4, _, err := tc.discoverUnmanagedVTEPIPs(vtep)
+		Expect(err).NotTo(HaveOccurred(), "discoverUnmanagedVTEPIPs failed")
+		Expect(v4.String()).To(Equal("100.64.0.53"), "unexpected selected VTEP IP")
+		tc.kubeMock.AssertCalled(GinkgoT(), "SetAnnotationsOnNodeWithFieldManager", nodeName, mock.Anything, vtepAnnotationFieldManager)
+		vteps, err := util.ParseNodeVTEPs(tc.node)
+		Expect(err).NotTo(HaveOccurred(), "failed to parse node VTEP annotation")
+		Expect(vteps["vtep1"].IPs).To(ConsistOf("100.64.0.53"), "unexpected annotated VTEP IPs")
+	})
+
+	It("keeps a previously annotated IP when it is the primary address or the primary is not a candidate", func() {
+		tc := newTestController(
+			[]net.IP{net.ParseIP("100.64.0.5"), net.ParseIP("100.64.0.2")},
+			map[string]string{
+				util.OvnNodeIfAddr: `{"ipv4":"192.168.1.10/24"}`,
+				util.OVNNodeVTEPs:  `{"vtep1":{"ips":["100.64.0.5"]}}`,
+			},
+		)
+		vtep := &vtepv1.VTEP{
+			ObjectMeta: metav1.ObjectMeta{Name: "vtep1"},
+			Spec:       vtepv1.VTEPSpec{CIDRs: []vtepv1.CIDR{"100.64.0.0/24"}},
+		}
+		v4, _, err := tc.discoverUnmanagedVTEPIPs(vtep)
+		Expect(err).NotTo(HaveOccurred(), "discoverUnmanagedVTEPIPs failed")
+		// sticky: the annotated .5 is kept even though .2 would sort lower
+		Expect(v4.String()).To(Equal("100.64.0.5"), "unexpected selected VTEP IP")
+		tc.kubeMock.AssertNotCalled(GinkgoT(), "SetAnnotationsOnNodeWithFieldManager", nodeName, mock.Anything, vtepAnnotationFieldManager)
 	})
 
 	It("picks the lowest IP when multiple non-VIP IPs match and annotates it", func() {

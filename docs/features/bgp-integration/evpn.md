@@ -390,6 +390,16 @@ ovnkube-node discovers IPs that fall within the VTEP CIDRs and annotates the
 node with `k8s.ovn.org/vteps`. Keepalived VIPs and secondary addresses are
 filtered out.
 
+When more than one address remains a candidate for an address family, the
+node's primary interface address (from the `k8s.ovn.org/node-primary-ifaddr`
+annotation) is preferred when it is one of the candidates. This avoids picking
+a VIP that cannot be identified by the filter above, such as a kube-vip
+address or any IPv6 VIP (IPv6 addresses carry no label), which typically sorts
+below the node address in the node subnet. Otherwise the numerically lowest
+candidate is selected. A previously annotated VTEP IP is kept as long as it is
+still a candidate, except that it is replaced by the primary address once the
+primary address becomes a candidate.
+
 ### OVN Configuration
 
 When EVPN is enabled for a network, ovnkube-controller configures OVN with the

@@ -273,6 +273,11 @@ func (c *Controller) onNodeUpdate(oldObj, newObj interface{}) {
 	if newNode.Name != c.nodeName {
 		return
 	}
+	// Primary-address updates must not be suppressed by the VTEP
+	// annotation's field-manager check below.
+	if oldNode.Annotations[util.OvnNodeIfAddr] != newNode.Annotations[util.OvnNodeIfAddr] {
+		c.vtepController.Reconcile(reconcileNodeAddressChange)
+	}
 	if !util.NodeVTEPsAnnotationChanged(oldNode, newNode) {
 		return
 	}
@@ -285,8 +290,8 @@ func (c *Controller) onNodeUpdate(oldObj, newObj interface{}) {
 }
 
 // reconcileNodeAddressChange triggers reconciliation for unmanaged VTEPs whose
-// annotated IPs are no longer valid or missing. Called when the node's
-// addresses change via the address manager callback.
+// annotated IPs are missing or no longer valid, or whose primary address
+// has become a candidate. Also called when the primary annotation changes.
 func (c *Controller) reconcileNodeAddressChange() error {
 	vtepsAnnotation, err := c.getVTEPsAnnotation()
 	if err != nil {
@@ -295,6 +300,13 @@ func (c *Controller) reconcileNodeAddressChange() error {
 
 	nodeIPs, _ := c.addressManager.ListAddresses()
 	nodeIPSet := sets.New(util.StringSlice(nodeIPs)...)
+	primaryIPv4 := c.nodePrimaryIP(netlink.FAMILY_V4)
+	primaryIPv6 := c.nodePrimaryIP(netlink.FAMILY_V6)
+	mayPreferPrimary := func(primary net.IP, annotated string) bool {
+		return primary != nil &&
+			!primary.Equal(net.ParseIP(annotated)) &&
+			nodeIPSet.Has(primary.String())
+	}
 
 	vteps, err := c.watchFactory.VTEPInformer().Lister().List(labels.Everything())
 	if err != nil {
@@ -310,10 +322,24 @@ func (c *Controller) reconcileNodeAddressChange() error {
 		v6AnnotatedIP := matchFirstIPStringFamily(true, vtepsAnnotation[vtep.Name].IPs)
 		missesIPv4 := needsIPv4 && !nodeIPSet.Has(v4AnnotatedIP)
 		missesIPv6 := needsIPv6 && !nodeIPSet.Has(v6AnnotatedIP)
-		if missesIPv4 || missesIPv6 {
-			klog.V(5).Infof("Node addresses changed on %s, reconciling unmanaged VTEP %s", c.nodeName, vtep.Name)
-			c.vtepController.Reconcile(vtep.Name)
+		if !missesIPv4 && !missesIPv6 {
+			preferIPv4 := needsIPv4 && mayPreferPrimary(primaryIPv4, v4AnnotatedIP)
+			preferIPv6 := needsIPv6 && mayPreferPrimary(primaryIPv6, v6AnnotatedIP)
+			// Avoid parsing CIDRs for unchanged or unavailable primaries.
+			if !preferIPv4 && !preferIPv6 {
+				continue
+			}
+			cidrs, err := util.ParseIPNets(vtep.Spec.CIDRs)
+			if err != nil {
+				return fmt.Errorf("failed to parse VTEP %q CIDRs: %w", vtep.Name, err)
+			}
+			if !(preferIPv4 && util.IsIPContainedInAnyCIDR(primaryIPv4, cidrs...)) &&
+				!(preferIPv6 && util.IsIPContainedInAnyCIDR(primaryIPv6, cidrs...)) {
+				continue
+			}
 		}
+		klog.V(5).Infof("Node addresses changed on %s, reconciling unmanaged VTEP %s", c.nodeName, vtep.Name)
+		c.vtepController.Reconcile(vtep.Name)
 	}
 
 	return nil
@@ -326,7 +352,7 @@ func (c *Controller) reconcileNodeAddressChange() error {
 // If the VTEP is deleted or unsupported, all its devices are cleaned up.
 // The synthetic keys reconcileVTEPAnnotationChange and
 // reconcileNodeAddressChange trigger reconciliation of unmanaged VTEPs
-// whose annotated IPs are stale or missing.
+// whose annotated IPs are stale or missing, or whose primary address is preferred.
 func (c *Controller) reconcile(key string) error {
 	switch key {
 	case reconcileVTEPAnnotationChange:
@@ -797,24 +823,34 @@ func (c *Controller) discoverUnmanagedVTEPIPs(vtep *vtepv1.VTEP) (net.IP, net.IP
 
 // resolveVTEPIP returns the IP to use for a given family. If the VTEP IP
 // is still present among the node IPs and within the VTEP's CIDRs, it is
-// returned. Otherwise, a new IP is selected from matching node IPs.
+// returned, unless the node's primary address is a better candidate that
+// was not available when the VTEP IP was chosen. Otherwise, a new IP is
+// selected from matching node IPs.
 func (c *Controller) resolveVTEPIP(family int, vtepCIDRs []*net.IPNet, nodeIPs []net.IP, vtepIP net.IP) (net.IP, error) {
 	if len(vtepCIDRs) == 0 {
 		return nil, nil
 	}
 
-	equalsVTEPIP := func(ip net.IP) bool { return ip.Equal(vtepIP) }
-	if vtepIP != nil && slices.ContainsFunc(nodeIPs, equalsVTEPIP) && util.IsIPContainedInAnyCIDR(vtepIP, vtepCIDRs...) {
-		return vtepIP, nil
-	}
-
-	// Select a new IP from node addresses matching the CIDRs.
 	var matches []net.IP
 	for _, nodeIP := range nodeIPs {
 		if util.IsIPContainedInAnyCIDR(nodeIP, vtepCIDRs...) {
 			matches = append(matches, nodeIP)
 		}
 	}
+
+	equalsVTEPIP := func(ip net.IP) bool { return ip.Equal(vtepIP) }
+	if vtepIP != nil && slices.ContainsFunc(matches, equalsVTEPIP) {
+		// A VIP may have been annotated before the primary address was
+		// available (or before this preference existed); converge to the
+		// primary address once it is a candidate instead of staying on the
+		// VIP until it moves away.
+		primary := c.nodePrimaryIP(family)
+		if primary == nil || primary.Equal(vtepIP) ||
+			!slices.ContainsFunc(matches, func(ip net.IP) bool { return ip.Equal(primary) }) {
+			return vtepIP, nil
+		}
+	}
+
 	return c.pickVTEPIP(matches, family)
 }
 
@@ -919,6 +955,15 @@ func (c *Controller) pickVTEPIP(matches []net.IP, family int) (net.IP, error) {
 			filtered = append(filtered, ip)
 		}
 	}
+	// VIPs that are not keepalived-labelled (e.g. kube-vip in routing-table
+	// mode, or any VIP on IPv6 where labels do not exist) survive the filter
+	// above and, being conventionally low in the subnet, would win the sort.
+	// The node's primary interface address is never a VIP: prefer it.
+	if primary := c.nodePrimaryIP(family); primary != nil &&
+		slices.ContainsFunc(filtered, func(ip net.IP) bool { return ip.Equal(primary) }) {
+		klog.Infof("Selecting node primary address %s as VTEP IP (family %d)", primary, family)
+		return primary, nil
+	}
 	slices.SortFunc(filtered, func(a, b net.IP) int {
 		addrA, _ := netip.AddrFromSlice(a)
 		addrB, _ := netip.AddrFromSlice(b)
@@ -929,6 +974,35 @@ func (c *Controller) pickVTEPIP(matches []net.IP, family int) (net.IP, error) {
 	}
 	return nil, nil
 
+}
+
+// nodePrimaryIP returns the node's primary interface address for the given
+// family from the k8s.ovn.org/node-primary-ifaddr annotation, or nil when it
+// is not available; callers fall back to their default selection.
+func (c *Controller) nodePrimaryIP(family int) net.IP {
+	node, err := c.watchFactory.GetNode(c.nodeName)
+	if err != nil {
+		klog.V(4).Infof("Failed to get node %s for primary address lookup: %v", c.nodeName, err)
+		return nil
+	}
+	ifAddr, err := util.GetNodeIfAddrAnnotation(node)
+	if err != nil {
+		klog.V(4).Infof("Node %s has no usable primary interface address annotation: %v", c.nodeName, err)
+		return nil
+	}
+	cidr := ifAddr.IPv4
+	if family == netlink.FAMILY_V6 {
+		cidr = ifAddr.IPv6
+	}
+	if cidr == "" {
+		return nil
+	}
+	ip, _, err := net.ParseCIDR(cidr)
+	if err != nil {
+		klog.V(4).Infof("Node %s primary interface address %q is not a valid CIDR: %v", c.nodeName, cidr, err)
+		return nil
+	}
+	return ip
 }
 
 func matchFirstIPStringFamily(isIPv6 bool, ips []string) string {
